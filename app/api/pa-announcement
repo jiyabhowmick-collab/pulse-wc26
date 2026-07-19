@@ -1,0 +1,82 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getClient, isAIConfigured, MODEL_NAME } from "@/lib/gemini";
+import { getStadiumSnapshot } from "@/lib/stadiumState";
+
+export const runtime = "nodejs";
+
+const SYSTEM_INSTRUCTION = `You are the PULSE Announcement Writer — you turn an operations recommendation into a short, calm, professional public-address script that a stadium announcer could read aloud immediately.
+
+Rules:
+- Write TWO versions: one in English, one in the requested second language.
+- Each version must be 2-3 sentences, spoken tone, no jargon, no exclamation points, calm and reassuring even if urgent.
+- Never cause panic — frame redirections and waits as normal, helpful guidance, not warnings.
+- Reference specific real details given to you (gate names, wait times) so it sounds grounded, not generic.
+- Respond ONLY with valid JSON, no markdown fences, no commentary, matching exactly:
+{
+  "english": "the english announcement script",
+  "translated": "the translated announcement script",
+  "language": "name of the language used for translated version"
+}`;
+
+export async function POST(req) {
+  try {
+    const { recommendation, targetLanguage } = await req.json();
+
+    if (!recommendation) {
+      return NextResponse.json({ error: "A recommendation is required" }, { status: 400 });
+    }
+
+    const snapshot = getStadiumSnapshot();
+    const lang = targetLanguage || "Spanish";
+
+    if (!isAIConfigured()) {
+      return NextResponse.json({
+        announcement: fallbackAnnouncement(recommendation, lang),
+        aiConfigured: false,
+      });
+    }
+
+    const ai = getClient();
+    if (!ai) {
+      return NextResponse.json({
+        announcement: fallbackAnnouncement(recommendation, lang),
+        aiConfigured: false,
+      });
+    }
+
+    const prompt = `Operational recommendation to turn into an announcement:\nTitle: ${recommendation.title}\nDetail: ${recommendation.detail}\nCategory: ${recommendation.category}\n\nCurrent match phase: ${snapshot.matchPhase}\n\nWrite the English version and a version translated into ${lang}. Return the JSON object.`;
+
+    const result = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: prompt,
+      config: { systemInstruction: SYSTEM_INSTRUCTION, temperature: 0.6, maxOutputTokens: 512 },
+    });
+
+    const raw = (result.text ?? "").trim();
+    const cleaned = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
+
+    let announcement;
+    try {
+      announcement = JSON.parse(cleaned);
+    } catch {
+      announcement = fallbackAnnouncement(recommendation, lang);
+    }
+
+    return NextResponse.json({ announcement, aiConfigured: true });
+  } catch (err) {
+    console.error("PA Announcement API error:", err);
+    return NextResponse.json({
+      announcement: fallbackAnnouncement({}, "Spanish"),
+      aiConfigured: false,
+      error: "AI temporarily unavailable.",
+    });
+  }
+}
+
+function fallbackAnnouncement(recommendation, lang) {
+  return {
+    english: `Attention fans: ${recommendation?.detail || "please follow steward guidance in your area."}`,
+    translated: `(Add GEMINI_API_KEY to unlock live translation into ${lang}.)`,
+    language: lang,
+  };
+}
